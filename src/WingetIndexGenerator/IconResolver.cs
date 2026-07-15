@@ -87,6 +87,8 @@ internal sealed class IconResolver : IDisposable
         try
         {
             var mergedManifest = await DownloadMergedManifestAsync(package, cancellationToken);
+            output.PackageUrl = NormalizeWebUrl(mergedManifest.PackageUrl);
+            output.PublisherUrl = NormalizeWebUrl(mergedManifest.PublisherUrl);
             var result = SelectIcon(mergedManifest);
 
             output.IconUrl = result.Url;
@@ -233,6 +235,16 @@ internal sealed class IconResolver : IDisposable
 
         iconUrl = $"https://github.com/{Uri.EscapeDataString(segments[0])}.png?size=128";
         return true;
+    }
+
+    private static string? NormalizeWebUrl(string? value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+        {
+            return null;
+        }
+
+        return uri.AbsoluteUri;
     }
 
     private static bool TryGetWebsiteFavicon(string? value, out string? iconUrl)

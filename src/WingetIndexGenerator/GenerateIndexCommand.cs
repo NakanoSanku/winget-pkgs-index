@@ -177,20 +177,33 @@ internal sealed class GenerateCommand : Command
             Tags = p.Tags?.Select(t => t.TagValue!).Distinct(StringComparer.OrdinalIgnoreCase).Order().ToList()
         }).ToList();
 
+        var existingIndexHasPackageLinks = false;
         if (File.Exists(outputFile))
         {
             var existingJson = await File.ReadAllTextAsync(outputFile, cancellationToken);
             var existingPackages = JsonSerializer.Deserialize<IEnumerable<Dto.PackageV2>>(existingJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             if (existingPackages != null)
             {
+                var existingPackageList = existingPackages.ToList();
+                existingIndexHasPackageLinks = existingPackageList.Any(package =>
+                    !string.IsNullOrWhiteSpace(package.PackageUrl) ||
+                    !string.IsNullOrWhiteSpace(package.PublisherUrl));
+                var existingPackagesByIdentity = existingPackageList
+                    .Where(package => !string.IsNullOrWhiteSpace(package.PackageId) && !string.IsNullOrWhiteSpace(package.Version))
+                    .ToDictionary(
+                        package => $"{package.PackageId}\u001f{package.Version}",
+                        StringComparer.OrdinalIgnoreCase);
+
                 foreach (var package in packageV2List)
                 {
-                    var existingPackage = existingPackages.FirstOrDefault(p => p.PackageId == package.PackageId && p.Version == package.Version);
-                    if (existingPackage != null)
+                    var identity = $"{package.PackageId}\u001f{package.Version}";
+                    if (existingPackagesByIdentity.TryGetValue(identity, out var existingPackage))
                     {
                         package.LastUpdate = existingPackage.LastUpdate;
                         package.IconUrl = existingPackage.IconUrl;
                         package.IconSource = existingPackage.IconSource;
+                        package.PackageUrl = existingPackage.PackageUrl;
+                        package.PublisherUrl = existingPackage.PublisherUrl;
                     }
                 }
             }
@@ -204,15 +217,19 @@ internal sealed class GenerateCommand : Command
             .Where(package => !string.IsNullOrWhiteSpace(package.PackageId))
             .ToDictionary(package => package.PackageId!, StringComparer.OrdinalIgnoreCase);
 
-        var packagesWithoutIcons = packages
+        var packagesNeedingMetadata = packages
             .Where(package => !string.IsNullOrWhiteSpace(package.Id))
             .Select(package => (Package: package, Output: outputByPackageId[package.Id!]))
-            .Where(item => string.IsNullOrWhiteSpace(item.Output.IconSource))
+            .Where(item =>
+                string.IsNullOrWhiteSpace(item.Output.IconSource) ||
+                (!existingIndexHasPackageLinks &&
+                 string.IsNullOrWhiteSpace(item.Output.PackageUrl) &&
+                 string.IsNullOrWhiteSpace(item.Output.PublisherUrl)))
             .ToList();
 
         using (var iconResolver = new IconResolver())
         {
-            await iconResolver.ResolveAllAsync(packagesWithoutIcons, cancellationToken);
+            await iconResolver.ResolveAllAsync(packagesNeedingMetadata, cancellationToken);
         }
 
         var json = JsonSerializer.Serialize(packageV2List, new JsonSerializerOptions { WriteIndented = false });
@@ -226,12 +243,12 @@ internal sealed class GenerateCommand : Command
         using var csv1Writer = new StreamWriter(Path.Combine(outputFolder, "index.csv"), false, System.Text.Encoding.UTF8);
         using var csv2Writer = new StreamWriter(Path.Combine(outputFolder, "index.v2.csv"), false, System.Text.Encoding.UTF8);
         await csv1Writer.WriteAsync("\"PackageId\",\"Version\"\r\n");
-        await csv2Writer.WriteAsync("\"PackageId\",\"Version\",\"Name\",\"Moniker\",\"IconUrl\",\"IconSource\",\"LastUpdate\"\r\n");
+        await csv2Writer.WriteAsync("\"PackageId\",\"Version\",\"Name\",\"Moniker\",\"IconUrl\",\"IconSource\",\"PackageUrl\",\"PublisherUrl\",\"LastUpdate\"\r\n");
 
         foreach (var package in packages)
         {
             await csv1Writer.WriteAsync($"\"{package.PackageId}\",\"{package.Version}\"\r\n");
-            await csv2Writer.WriteAsync($"\"{package.PackageId}\",\"{package.Version}\",\"{package.Name}\",\"{package.Moniker}\",\"{package.IconUrl}\",\"{package.IconSource}\",\"{package.LastUpdate:yyyy-MM-dd HH:mm:ssZ}\"\r\n");
+            await csv2Writer.WriteAsync($"\"{package.PackageId}\",\"{package.Version}\",\"{package.Name}\",\"{package.Moniker}\",\"{package.IconUrl}\",\"{package.IconSource}\",\"{package.PackageUrl}\",\"{package.PublisherUrl}\",\"{package.LastUpdate:yyyy-MM-dd HH:mm:ssZ}\"\r\n");
             if (cancellationToken.IsCancellationRequested)
             {
                 break;
