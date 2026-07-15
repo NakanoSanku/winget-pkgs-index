@@ -13,6 +13,10 @@ public class PackageV2
     public string? IconUrl { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? IconSource { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PackageUrl { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PublisherUrl { get; set; }
     public IEnumerable<string>? Tags { get; set; }
     public DateTimeOffset? LastUpdate { get; set; }
 
