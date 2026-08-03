@@ -17,7 +17,7 @@ Documentation: [wintuner.app/docs/related/winget-package-index/](https://wintune
 | CSV | [index.csv](https://github.com/svrooij/winget-pkgs-index/blob/main/index.csv) | `https://github.com/svrooij/winget-pkgs-index/raw/main/index.csv` |
 | JSON | [index.json](https://github.com/svrooij/winget-pkgs-index/blob/main/index.json) | `https://github.com/svrooij/winget-pkgs-index/raw/main/index.json` |
 
-The v2 indexes include the package name, ID, latest version, moniker, icon URL, icon source, package URL, publisher URL, tags, and last update timestamp. Icon URLs prefer the official icon from the merged WinGet manifest, then fall back to a GitHub owner avatar or website favicon inferred from package metadata. Package and publisher URLs come directly from the merged WinGet manifest. Optional JSON fields are omitted when unavailable.
+The v2 indexes include the package name, ID, latest version, available versions, moniker, icon URL, icon source, package URL, publisher URL, tags, and last update timestamp. The `Versions` field contains the available versions for the package in newest-first order. Icon URLs prefer the official icon from the merged WinGet manifest, then fall back to a GitHub owner avatar or website favicon inferred from package metadata. Package and publisher URLs come directly from the merged WinGet manifest. Optional JSON fields are omitted when unavailable.
 
 ## Version wrong?
 

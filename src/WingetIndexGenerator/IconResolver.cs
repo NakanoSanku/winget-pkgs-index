@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using SabreTools.Compression.MSZIP;
 using WingetIndexGenerator.Dto;
 using WingetIndexGenerator.Models;
@@ -16,6 +18,7 @@ internal sealed class IconResolver : IDisposable
     private readonly HttpClient _httpClient;
     private readonly IDeserializer _yamlDeserializer;
     private readonly SemaphoreSlim _semaphore = new(MaxConcurrency);
+    private readonly ConcurrentDictionary<string, PackageVersionDataManifest> _versionDataCache = new(StringComparer.OrdinalIgnoreCase);
 
     private int _completed;
     private int _manifestIcons;
@@ -23,6 +26,9 @@ internal sealed class IconResolver : IDisposable
     private int _faviconIcons;
     private int _noIcons;
     private int _failures;
+    private int _versionFailures;
+
+    private static readonly Regex VersionTokenRegex = new(@"\d+|\D+", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     internal IconResolver()
     {
@@ -75,6 +81,51 @@ internal sealed class IconResolver : IDisposable
             $"favicon={_faviconIcons}, none={_noIcons}, failures={_failures}.");
     }
 
+    internal async Task ResolveVersionsAsync(
+        IEnumerable<(Package Package, PackageV2 Output)> packages,
+        CancellationToken cancellationToken)
+    {
+        var items = packages.ToList();
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        Console.WriteLine($"Resolving versions for {items.Count} packages with {MaxConcurrency} concurrent requests.");
+
+        var tasks = items.Select(async item =>
+        {
+            await _semaphore.WaitAsync(cancellationToken);
+            try
+            {
+                var versionData = await DownloadVersionDataAsync(item.Package, cancellationToken);
+                var versions = versionData.Versions?
+                    .Select(version => version.Version)
+                    .Where(version => !string.IsNullOrWhiteSpace(version))
+                    .Select(version => version!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(version => version, WingetVersionComparer.Instance)
+                    .ToList();
+
+                item.Output.Versions = versions is { Count: > 0 }
+                    ? versions
+                    : CreateFallbackVersions(item.Package);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidDataException or YamlDotNet.Core.YamlException)
+            {
+                item.Output.Versions = CreateFallbackVersions(item.Package);
+                Interlocked.Increment(ref _versionFailures);
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+        Console.WriteLine($"Version resolution complete: failures={_versionFailures}.");
+    }
+
     private async Task ResolveAsync(Package package, PackageV2 output, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(package.Id) || package.Hash is not { Length: > 0 })
@@ -118,13 +169,7 @@ internal sealed class IconResolver : IDisposable
 
     private async Task<MergedManifest> DownloadMergedManifestAsync(Package package, CancellationToken cancellationToken)
     {
-        var packageHash = Convert.ToHexString(package.Hash!).ToLowerInvariant();
-        var packageId = Uri.EscapeDataString(package.Id!);
-        var versionDataPath = $"packages/{packageId}/{packageHash[..8]}/versionData.mszyml";
-
-        var compressedVersionData = await _httpClient.GetByteArrayAsync(versionDataPath, cancellationToken);
-        var versionDataYaml = DecompressVersionData(compressedVersionData);
-        var versionData = _yamlDeserializer.Deserialize<PackageVersionDataManifest>(versionDataYaml);
+        var versionData = await DownloadVersionDataAsync(package, cancellationToken);
 
         var latestVersion = versionData.Versions?
             .FirstOrDefault(version => string.Equals(version.Version, package.LatestVersion, StringComparison.OrdinalIgnoreCase))
@@ -148,6 +193,36 @@ internal sealed class IconResolver : IDisposable
 
         return _yamlDeserializer.Deserialize<MergedManifest>(Encoding.UTF8.GetString(manifestBytes));
     }
+
+    private async Task<PackageVersionDataManifest> DownloadVersionDataAsync(Package package, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(package.Id) || package.Hash is not { Length: > 0 })
+        {
+            throw new InvalidDataException($"No package identity data found for {package.Id}.");
+        }
+
+        var packageHash = Convert.ToHexString(package.Hash).ToLowerInvariant();
+        var cacheKey = $"{package.Id}\u001f{packageHash}";
+        if (_versionDataCache.TryGetValue(cacheKey, out var cachedVersionData))
+        {
+            return cachedVersionData;
+        }
+
+        var packageId = Uri.EscapeDataString(package.Id);
+        var versionDataPath = $"packages/{packageId}/{packageHash[..8]}/versionData.mszyml";
+        var compressedVersionData = await _httpClient.GetByteArrayAsync(versionDataPath, cancellationToken);
+        var versionDataYaml = DecompressVersionData(compressedVersionData);
+        var versionData = _yamlDeserializer.Deserialize<PackageVersionDataManifest>(versionDataYaml)
+            ?? throw new InvalidDataException($"No version data found for {package.Id}.");
+
+        _versionDataCache.TryAdd(cacheKey, versionData);
+        return versionData;
+    }
+
+    private static List<string> CreateFallbackVersions(Package package) =>
+        string.IsNullOrWhiteSpace(package.LatestVersion)
+            ? []
+            : [package.LatestVersion];
 
     private static string DecompressVersionData(byte[] compressed)
     {
@@ -310,6 +385,83 @@ internal sealed class IconResolver : IDisposable
         "custom" => 6,
         _ => 7,
     };
+
+    private sealed class WingetVersionComparer : IComparer<string>
+    {
+        internal static readonly WingetVersionComparer Instance = new();
+
+        public int Compare(string? x, string? y)
+        {
+            if (ReferenceEquals(x, y)) return 0;
+            if (x is null) return -1;
+            if (y is null) return 1;
+
+            var xCore = GetCoreVersion(x, out var xSuffix);
+            var yCore = GetCoreVersion(y, out var ySuffix);
+            var coreComparison = CompareTokenized(xCore, yCore);
+            if (coreComparison != 0)
+            {
+                return coreComparison;
+            }
+
+            if (xSuffix is null && ySuffix is not null) return 1;
+            if (xSuffix is not null && ySuffix is null) return -1;
+            return StringComparer.OrdinalIgnoreCase.Compare(x, y);
+        }
+
+        private static string GetCoreVersion(string value, out string? suffix)
+        {
+            var separatorIndex = value.IndexOfAny(['-', '+']);
+            if (separatorIndex < 0)
+            {
+                suffix = null;
+                return value.TrimStart('v', 'V');
+            }
+
+            suffix = value[(separatorIndex + 1)..];
+            return value[..separatorIndex].TrimStart('v', 'V');
+        }
+
+        private static int CompareTokenized(string left, string right)
+        {
+            var leftTokens = VersionTokenRegex.Matches(left).Select(match => match.Value).ToArray();
+            var rightTokens = VersionTokenRegex.Matches(right).Select(match => match.Value).ToArray();
+            var count = Math.Min(leftTokens.Length, rightTokens.Length);
+
+            for (var index = 0; index < count; index++)
+            {
+                var leftToken = leftTokens[index];
+                var rightToken = rightTokens[index];
+                var leftIsNumber = leftToken.All(char.IsDigit);
+                var rightIsNumber = rightToken.All(char.IsDigit);
+
+                if (leftIsNumber && rightIsNumber)
+                {
+                    var numericComparison = CompareNumericTokens(leftToken, rightToken);
+                    if (numericComparison != 0) return numericComparison;
+                }
+                else
+                {
+                    var textComparison = StringComparer.OrdinalIgnoreCase.Compare(leftToken, rightToken);
+                    if (textComparison != 0) return textComparison;
+                }
+            }
+
+            return leftTokens.Length.CompareTo(rightTokens.Length);
+        }
+
+        private static int CompareNumericTokens(string left, string right)
+        {
+            var normalizedLeft = left.TrimStart('0');
+            var normalizedRight = right.TrimStart('0');
+            if (normalizedLeft.Length == 0) normalizedLeft = "0";
+            if (normalizedRight.Length == 0) normalizedRight = "0";
+
+            return normalizedLeft.Length != normalizedRight.Length
+                ? normalizedLeft.Length.CompareTo(normalizedRight.Length)
+                : StringComparer.Ordinal.Compare(normalizedLeft, normalizedRight);
+        }
+    }
 
     public void Dispose()
     {

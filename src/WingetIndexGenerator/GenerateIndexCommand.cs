@@ -172,6 +172,7 @@ internal sealed class GenerateCommand : Command
             Name = p.Name,
             PackageId = p.Id,
             Version = p.LatestVersion,
+            Versions = null,
             Moniker = string.IsNullOrWhiteSpace(p.Moniker) ? null : p.Moniker,
             LastUpdate = timestamp,
             Tags = p.Tags?.Select(t => t.TagValue!).Distinct(StringComparer.OrdinalIgnoreCase).Order().ToList()
@@ -204,6 +205,7 @@ internal sealed class GenerateCommand : Command
                         package.IconSource = existingPackage.IconSource;
                         package.PackageUrl = existingPackage.PackageUrl;
                         package.PublisherUrl = existingPackage.PublisherUrl;
+                        package.Versions = existingPackage.Versions?.ToList();
                     }
                 }
             }
@@ -227,8 +229,15 @@ internal sealed class GenerateCommand : Command
                  string.IsNullOrWhiteSpace(item.Output.PublisherUrl)))
             .ToList();
 
+        var packagesNeedingVersions = packages
+            .Where(package => !string.IsNullOrWhiteSpace(package.Id))
+            .Select(package => (Package: package, Output: outputByPackageId[package.Id!]))
+            .Where(item => item.Output.Versions is null || item.Output.Versions.Count == 0)
+            .ToList();
+
         using (var iconResolver = new IconResolver())
         {
+            await iconResolver.ResolveVersionsAsync(packagesNeedingVersions, cancellationToken);
             await iconResolver.ResolveAllAsync(packagesNeedingMetadata, cancellationToken);
         }
 
